@@ -5,10 +5,10 @@ project(TestHooks
        DESCRIPTION "Hooks for end to end automated testing"
        LANGUAGES CXX)
 
-add_definitions("-std=c++latest")
-
 include(${CMAKE_BINARY_DIR}/conanbuildinfo.cmake)
 conan_basic_setup()
 
-add_library(TestHooks Hooks.cpp)
+add_library(TestHooks STATIC "")
 target_link_libraries(TestHooks ${CONAN_LIBS})
+
+add_subdirectory(Source)
