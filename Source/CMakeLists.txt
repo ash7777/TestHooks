@@ -7,4 +7,8 @@ add_definitions("-std=c++latest")
 target_sources(TestHooks PUBLIC
        Hooks.cpp)
 
+include_directories(.)
+target_include_directories(TestHooks
+                           PUBLIC .)
+
 add_subdirectory(MinHook)

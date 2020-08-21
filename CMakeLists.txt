@@ -12,3 +12,4 @@ add_library(TestHooks STATIC "")
 target_link_libraries(TestHooks ${CONAN_LIBS})
 
 add_subdirectory(Source)
+add_subdirectory(Tests)
