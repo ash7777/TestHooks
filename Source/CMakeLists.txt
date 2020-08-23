@@ -1,8 +1,6 @@
-cmake_minimum_required(VERSION 2.8.12)
-cmake_policy(SET CMP0048 NEW)
-cmake_policy(SET CMP0076 NEW)
+cmake_minimum_required(VERSION 3.13)
 
-add_definitions("-std=c++latest")
+add_definitions("/std:c++latest")
 
 target_sources(TestHooks PUBLIC
        Hooks.cpp)
@@ -10,5 +8,7 @@ target_sources(TestHooks PUBLIC
 include_directories(.)
 target_include_directories(TestHooks
                            PUBLIC .)
+
+target_link_libraries(TestHooks MinHook)
 
 add_subdirectory(MinHook)

@@ -1,17 +1,20 @@
-#include <Windows.h>
 #include <boost/test/data/test_case.hpp>
 #include <boost/test/unit_test.hpp>
+#include <mutex>
+#include <Windows.h>
 #include "MinHook/include/MinHook.h"
 
 #include <setupapi.h>
 #include <winreg.h>
+
+#undef AddMonitor
 
 namespace TestHooks
 {
 	class FakeHandleCreator
 	{
 	private:
-		static size_t			m_nextHandle;
+		static inline size_t			m_nextHandle { 0x01000000 };
 	public:
 		FakeHandleCreator()
 		{
@@ -23,25 +26,92 @@ namespace TestHooks
 		}
 	};
 
+	using FilterCookie = unsigned int;
+	inline constexpr FilterCookie InvalidCookie { 0 };
+
+	template<typename FilterType>
+	class HookContainer
+	{
+	private:
+		FilterCookie m_nextFilterCookie;
+		std::map<FilterCookie, FilterType> m_filters;
+		std::recursive_mutex m_mutex;
+	public:
+		HookContainer()
+			: m_nextFilterCookie(1)
+		{
+		}
+
+		~HookContainer()
+		{
+			assert(m_filters.empty());
+		}
+
+		FilterCookie AddFilter(FilterType newFilter)
+		{
+			std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+			FilterCookie result = m_nextFilterCookie++;
+			m_filters.insert(std::make_pair(result, newFilter));
+
+			return result;
+		}
+
+		void RemoveFilter(FilterCookie cookie)
+		{
+			std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+			auto iterator = m_filters.find(cookie);
+			assert(iterator != std::end(m_filters));
+			m_filters.erase(iterator);
+		}
+
+		template<typename FilterType>
+		bool ForEachFilterReturningBoolean(FilterType doFilter)
+		{
+			std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+			return std::any_of(std::begin(m_filters), std::end(m_filters), [&](auto& filterPair) {
+					return doFilter(filterPair.second);
+				});
+
+			return false;
+		}
+
+		template<typename FilterType>
+		void ForEachVoidFilter(FilterType doFilter)
+		{
+			std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+			std::for_each(std::begin(m_filters), std::end(m_filters), [&](auto& filterPair) {
+				doFilter(filterPair.second);
+				});
+		}
+	};
+
 	class CloseHandleHook
 	{
 	private:
-		using Filter = std::function<bool(const CloseHandleHook& hook, HANDLE handle, BOOL& result)>;
+		using Filter = std::function<bool(HANDLE handle, BOOL& result)>;
+		using Monitor = std::function<void(HANDLE handle, BOOL result)>;
 
 		typedef BOOL(WINAPI* CloseHandleType)(HANDLE);
 
-		static CloseHandleType fpCloseHandle;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline CloseHandleType fpCloseHandle;
+		static inline int HookCount;
+		static inline HookContainer<Filter> m_filterHookContainer;
+		static inline HookContainer<Monitor> m_monitorHookContainer;
 
 		static BOOL WINAPI DetourCloseHandle(HANDLE hObject)
 		{
-			return fpCloseHandle(hObject);
-		}
+			BOOL result;
+			if (m_filterHookContainer.ForEachFilterReturningBoolean([&](Filter& filter) { return filter(hObject, result); }))
+				return result;
 
-		static BOOL WINAPI CloseHandleHandler(HANDLE hObject)
-		{
-			return DetourCloseHandle(hObject);
+			result = fpCloseHandle(hObject);
+			m_monitorHookContainer.ForEachVoidFilter([&](Monitor& monitor) { monitor(hObject, result); });
+
+			return result;
 		}
 
 	public:
@@ -62,9 +132,325 @@ namespace TestHooks
 				MH_DisableHook(&CloseHandle);
 		}
 
-		void AddFilter(Filter newFilter)
+		FilterCookie AddFilter(Filter newFilter)
 		{
-			filters.push_back(newFilter);
+			return m_filterHookContainer.AddFilter(newFilter);
+		}
+
+		void RemoveFilter(FilterCookie cookie)
+		{
+			m_filterHookContainer.RemoveFilter(cookie);
+		}
+
+		FilterCookie AddMonitor(Monitor newMonitor)
+		{
+			return m_monitorHookContainer.AddFilter(newMonitor);
+		}
+
+		void RemoveMonitor(FilterCookie cookie)
+		{
+			m_monitorHookContainer.RemoveFilter(cookie);
+		}
+	};
+
+	class ReadFileHook
+	{
+	private:
+		using Filter = std::function<bool(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPOVERLAPPED lpOverlapped,
+			LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine, BOOL& result)>;
+		using Monitor = std::function<void(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPOVERLAPPED lpOverlapped,
+			LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine, BOOL result)>;
+
+		typedef BOOL(WINAPI* ReadFileType)(HANDLE, LPVOID, DWORD, LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE);
+
+		static inline ReadFileType fpReadFile;
+		static inline int HookCount;
+		static inline HookContainer<Filter> m_filterHookContainer;
+		static inline HookContainer<Monitor> m_monitorHookContainer;
+
+		static BOOL WINAPI DetourReadFile(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPOVERLAPPED lpOverlapped,
+			LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine)
+		{
+			BOOL result;
+			if (m_filterHookContainer.ForEachFilterReturningBoolean([&](Filter& filter) { return filter(hFile, lpBuffer, nNumberOfBytesToRead, lpOverlapped, lpCompletionRoutine, result); }))
+				return result;
+
+			result = fpReadFile(hFile, lpBuffer, nNumberOfBytesToRead, lpOverlapped, lpCompletionRoutine);
+			m_monitorHookContainer.ForEachVoidFilter([&](Monitor& monitor) { monitor(hFile, lpBuffer, nNumberOfBytesToRead, lpOverlapped, lpCompletionRoutine, result); });
+
+			return result;
+		}
+
+	public:
+		ReadFileHook()
+		{
+			if (HookCount == 0)
+			{
+				MH_CreateHook(&ReadFile, &DetourReadFile, reinterpret_cast<LPVOID*>(&fpReadFile));
+				MH_EnableHook(&ReadFile);
+			}
+			HookCount++;
+		}
+
+		~ReadFileHook()
+		{
+			HookCount--;
+			if (HookCount == 0)
+				MH_DisableHook(&ReadFile);
+		}
+
+		FilterCookie AddFilter(Filter newFilter)
+		{
+			return m_filterHookContainer.AddFilter(newFilter);
+		}
+
+		void RemoveFilter(FilterCookie cookie)
+		{
+			m_filterHookContainer.RemoveFilter(cookie);
+		}
+
+		FilterCookie AddMonitor(Monitor newMonitor)
+		{
+			return m_monitorHookContainer.AddFilter(newMonitor);
+		}
+
+		void RemoveMonitor(FilterCookie cookie)
+		{
+			m_monitorHookContainer.RemoveFilter(cookie);
+		}
+	};
+
+	class WriteFileHook
+	{
+	private:
+		using Filter = std::function<bool(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+			LPOVERLAPPED lpOverlapped, BOOL& result)>;
+		using Monitor = std::function<void(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+			LPOVERLAPPED lpOverlapped, BOOL result)>;
+
+		typedef BOOL(WINAPI* WriteFileType)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+
+		static inline WriteFileType fpWriteFile;
+		static inline int HookCount;
+		static inline HookContainer<Filter> m_filterHookContainer;
+		static inline HookContainer<Monitor> m_monitorHookContainer;
+
+		static BOOL WINAPI DetourWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+			LPOVERLAPPED lpOverlapped)
+		{
+			BOOL result;
+			if (m_filterHookContainer.ForEachFilterReturningBoolean([&](Filter& filter) { return filter(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped, result); }))
+				return result;
+
+			result = fpWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+			m_monitorHookContainer.ForEachVoidFilter([&](Monitor& monitor) { monitor(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped, result); });
+
+			return result;
+		}
+
+	public:
+		WriteFileHook()
+		{
+			if (HookCount == 0)
+			{
+				MH_CreateHook(&WriteFile, &DetourWriteFile, reinterpret_cast<LPVOID*>(&fpWriteFile));
+				MH_EnableHook(&WriteFile);
+			}
+			HookCount++;
+		}
+
+		~WriteFileHook()
+		{
+			HookCount--;
+			if (HookCount == 0)
+				MH_DisableHook(&WriteFile);
+		}
+
+		FilterCookie AddFilter(Filter newFilter)
+		{
+			return m_filterHookContainer.AddFilter(newFilter);
+		}
+
+		void RemoveFilter(FilterCookie cookie)
+		{
+			m_filterHookContainer.RemoveFilter(cookie);
+		}
+
+		FilterCookie AddMonitor(Monitor newMonitor)
+		{
+			return m_monitorHookContainer.AddFilter(newMonitor);
+		}
+
+		void RemoveMonitor(FilterCookie cookie)
+		{
+			m_monitorHookContainer.RemoveFilter(cookie);
+		}
+	};
+
+	class CreateFileWHook
+	{
+	private:
+		using Filter = std::function<bool(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+				LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile,
+				HANDLE& result)>;
+		using Monitor = std::function<void(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+			LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile,
+			HANDLE result)>;
+
+		typedef HANDLE(WINAPI* CreateFileType)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
+
+		static inline CreateFileType fpCreateFile;
+		static inline int m_hookCount;
+		static inline HookContainer<Filter> m_filterHookContainer;
+		static inline HookContainer<Monitor> m_monitorHookContainer;
+
+		static HANDLE WINAPI DetourCreateFile(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+			LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile)
+		{
+			HANDLE result;
+			if (m_filterHookContainer.ForEachFilterReturningBoolean([&](Filter& filter) { return filter(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, result); }))
+				return result;
+
+			result = fpCreateFile(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+			m_monitorHookContainer.ForEachVoidFilter([&](Monitor& monitor) { monitor(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile, result); });
+
+			return result;
+		}
+
+	public:
+		CreateFileWHook()
+		{
+			if (m_hookCount == 0)
+			{
+				MH_CreateHook(&CreateFileW, &DetourCreateFile, reinterpret_cast<LPVOID*>(&fpCreateFile));
+				MH_EnableHook(&CreateFileW);
+			}
+			m_hookCount++;
+		}
+
+		~CreateFileWHook()
+		{
+			m_hookCount--;
+			if (m_hookCount == 0)
+				MH_DisableHook(&CreateFileW);
+		}
+
+		FilterCookie AddFilter(Filter newFilter)
+		{
+			return m_filterHookContainer.AddFilter(newFilter);
+		}
+
+		void RemoveFilter(FilterCookie cookie)
+		{
+			m_filterHookContainer.RemoveFilter(cookie);
+		}
+
+		FilterCookie AddMonitor(Monitor newMonitor)
+		{
+			return m_monitorHookContainer.AddFilter(newMonitor);
+		}
+
+		void RemoveMonitor(FilterCookie cookie)
+		{
+			m_monitorHookContainer.RemoveFilter(cookie);
+		}
+	};
+
+	/// <summary>
+	/// /////////////////////////////////////////////////////////////////////////////////
+	/// </summary>
+	class FileHook
+	{
+	private:
+		CloseHandleHook				m_closeHandleHook;
+		FilterCookie				m_closeHandleFilterCookie;
+		FilterCookie				m_closeHandleMonitorCookie;
+		CreateFileWHook				m_createFileWHook;
+		FilterCookie				m_createFileWFilterCookie;
+		FilterCookie				m_createFileWMonitorCookie;
+		ReadFileHook				m_readFileHook;
+		FilterCookie				m_readFileFilterCookie;
+		FilterCookie				m_readFileMonitorCookie;
+		WriteFileHook				m_writeFileHook;
+		FilterCookie				m_writeFileFilterCookie;
+		FilterCookie				m_writeFileMonitorCookie;
+
+	public:
+		FileHook()
+			: m_closeHandleFilterCookie { InvalidCookie },
+			  m_closeHandleMonitorCookie { InvalidCookie },
+			  m_createFileWFilterCookie { InvalidCookie },
+			  m_createFileWMonitorCookie { InvalidCookie },
+			  m_readFileFilterCookie { InvalidCookie },
+			  m_readFileMonitorCookie { InvalidCookie },
+			  m_writeFileFilterCookie { InvalidCookie },
+			  m_writeFileMonitorCookie { InvalidCookie }
+		{
+			m_closeHandleFilterCookie = m_closeHandleHook.AddFilter(std::bind(&FileHook::CloseHandleFilterHook, this, std::placeholders::_1, std::placeholders::_2));
+			m_closeHandleMonitorCookie = m_closeHandleHook.AddMonitor(std::bind(&FileHook::CloseHandleMonitorHook, this, std::placeholders::_1, std::placeholders::_2));
+			m_createFileWFilterCookie = m_createFileWHook.AddFilter(std::bind(&FileHook::CreateFileWFilterHook, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6, std::placeholders::_7, std::placeholders::_8));
+			m_createFileWMonitorCookie = m_createFileWHook.AddMonitor(std::bind(&FileHook::CreateFileWMonitorHook, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6, std::placeholders::_7, std::placeholders::_8));
+			m_readFileFilterCookie = m_readFileHook.AddFilter(std::bind(&FileHook::ReadFileFilterHook, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+			m_readFileMonitorCookie = m_readFileHook.AddMonitor(std::bind(&FileHook::ReadFileMonitorHook, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+			m_writeFileFilterCookie = m_writeFileHook.AddFilter(std::bind(&FileHook::WriteFileFilterHook, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+			m_writeFileMonitorCookie = m_writeFileHook.AddMonitor(std::bind(&FileHook::WriteFileMonitorHook, this, std::placeholders::_1, std::placeholders::_2, std::placeholders::_3, std::placeholders::_4, std::placeholders::_5, std::placeholders::_6));
+		}
+
+		~FileHook()
+		{
+			m_closeHandleHook.RemoveFilter(m_closeHandleFilterCookie);
+			m_closeHandleHook.RemoveMonitor(m_closeHandleMonitorCookie);
+			m_createFileWHook.RemoveFilter(m_createFileWFilterCookie);
+			m_createFileWHook.RemoveMonitor(m_createFileWMonitorCookie);
+			m_readFileHook.RemoveFilter(m_readFileFilterCookie);
+			m_readFileHook.RemoveMonitor(m_readFileMonitorCookie);
+			m_writeFileHook.RemoveFilter(m_writeFileFilterCookie);
+			m_writeFileHook.RemoveMonitor(m_writeFileMonitorCookie);
+		}
+
+	private:
+		bool CloseHandleFilterHook(HANDLE handle, BOOL& result)
+		{
+			return false;
+		}
+
+		void CloseHandleMonitorHook(HANDLE handle, BOOL result)
+		{
+		}
+
+		bool CreateFileWFilterHook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+			LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile,
+			HANDLE& result)
+		{
+			return false;
+		}
+
+		void CreateFileWMonitorHook(LPCWSTR lpFileName, DWORD dwDesiredAccess, DWORD dwShareMode,
+			LPSECURITY_ATTRIBUTES lpSecurityAttributes, DWORD dwCreationDisposition, DWORD dwFlagsAndAttributes, HANDLE hTemplateFile,
+			HANDLE result)
+		{
+		}
+
+		bool ReadFileFilterHook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPOVERLAPPED lpOverlapped,
+			LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine, BOOL& result)
+		{
+			return false;
+		}
+
+		void ReadFileMonitorHook(HANDLE hFile, LPVOID lpBuffer, DWORD nNumberOfBytesToRead, LPOVERLAPPED lpOverlapped,
+			LPOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine, BOOL result)
+		{
+		}
+
+		bool WriteFileFilterHook(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+			LPOVERLAPPED lpOverlapped, BOOL& result)
+		{
+			return false;
+		}
+
+		void WriteFileMonitorHook(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten,
+			LPOVERLAPPED lpOverlapped, BOOL result)
+		{
 		}
 	};
 
@@ -75,9 +461,9 @@ namespace TestHooks
 
 		typedef HDEVINFO(WINAPI* SetupDiGetClassDevsWType)(CONST GUID* ClassGuid, PCWSTR Enumerator, HWND hwndParent, DWORD Flags);
 
-		static SetupDiGetClassDevsWType fpSetupDiGetClassDevsW;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline SetupDiGetClassDevsWType fpSetupDiGetClassDevsW;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static int SerialPortCount;
 
@@ -123,9 +509,9 @@ namespace TestHooks
 
 		typedef BOOL(WINAPI* SetupDiEnumDeviceInfoType)(HDEVINFO DeviceInfoSet, DWORD MemberIndex, PSP_DEVINFO_DATA DeviceInfoData);
 
-		static SetupDiEnumDeviceInfoType fpSetupDiEnumDeviceInfo;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline SetupDiEnumDeviceInfoType fpSetupDiEnumDeviceInfo;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static BOOL WINAPI DetourSetupDiEnumDeviceInfo(HDEVINFO DeviceInfoSet, DWORD MemberIndex, PSP_DEVINFO_DATA DeviceInfoData)
 		{
@@ -169,9 +555,9 @@ namespace TestHooks
 
 		typedef BOOL(WINAPI* SetupDiDestroyDeviceInfoListType)(HDEVINFO DeviceInfoSet);
 
-		static SetupDiDestroyDeviceInfoListType fpSetupDiDestroyDeviceInfoList;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline SetupDiDestroyDeviceInfoListType fpSetupDiDestroyDeviceInfoList;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static BOOL WINAPI DetourSetupDiDestroyDeviceInfoList(HDEVINFO DeviceInfoSet)
 		{
@@ -215,9 +601,9 @@ namespace TestHooks
 
 		typedef BOOL(WINAPI* SetupDiGetDeviceRegistryPropertyType)(HDEVINFO DeviceInfoSet, PSP_DEVINFO_DATA DeviceInfoData, DWORD Property, PDWORD PropertyRegDataType, PBYTE PropertyBuffer, DWORD PropertyBufferSize, PDWORD RequiredSize);
 
-		static SetupDiGetDeviceRegistryPropertyType fpSetupDiGetDeviceRegistryProperty;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline SetupDiGetDeviceRegistryPropertyType fpSetupDiGetDeviceRegistryProperty;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static BOOL WINAPI DetourSetupDiGetDeviceRegistryProperty(HDEVINFO DeviceInfoSet, PSP_DEVINFO_DATA DeviceInfoData, DWORD Property, PDWORD PropertyRegDataType, PBYTE PropertyBuffer, DWORD PropertyBufferSize, PDWORD RequiredSize)
 		{
@@ -261,9 +647,9 @@ namespace TestHooks
 
 		typedef HKEY(WINAPI* SetupDiOpenDevRegKeyType)(HDEVINFO DeviceInfoSet, PSP_DEVINFO_DATA DeviceInfoData, DWORD Scope, DWORD HwProfile, DWORD KeyType, REGSAM samDesired);
 
-		static SetupDiOpenDevRegKeyType fpSetupDiOpenDevRegKey;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline SetupDiOpenDevRegKeyType fpSetupDiOpenDevRegKey;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static HKEY WINAPI DetourSetupDiOpenDevRegKey(HDEVINFO DeviceInfoSet, PSP_DEVINFO_DATA DeviceInfoData, DWORD Scope, DWORD HwProfile, DWORD KeyType, REGSAM samDesired)
 		{
@@ -307,9 +693,9 @@ namespace TestHooks
 
 		typedef LSTATUS(WINAPI* RegGetValueWType)(HKEY hkey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData);
 
-		static RegGetValueWType fpRegGetValueW;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline RegGetValueWType fpRegGetValueW;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static LSTATUS WINAPI DetourRegGetValueW(HKEY hkey, LPCWSTR lpSubKey, LPCWSTR lpValue, DWORD dwFlags, LPDWORD pdwType, PVOID pvData, LPDWORD pcbData)
 		{
@@ -353,9 +739,9 @@ namespace TestHooks
 
 		typedef LSTATUS(WINAPI* RegCloseKeyType)(HKEY hKey);
 
-		static RegCloseKeyType fpRegCloseKey;
-		static int HookCount;
-		static std::vector<Filter> filters;
+		static inline RegCloseKeyType fpRegCloseKey;
+		static inline int HookCount;
+		static inline std::vector<Filter> filters;
 
 		static LSTATUS WINAPI DetourRegCloseKey(HKEY hKey)
 		{
